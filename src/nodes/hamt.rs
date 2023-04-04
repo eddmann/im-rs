@@ -546,6 +546,92 @@ impl<'a, A> ExactSizeIterator for Iter<'a, A> where A: 'a {}
 
 impl<'a, A> FusedIterator for Iter<'a, A> where A: 'a {}
 
+// Ordered Ref iterator.
+// Given a deterministic hasher, this iterator yields values in a deterministic
+// order: two sets with the same elements are enumerated in the same order
+// regardless of the order in which elements were inserted in the sets.  Items
+// are returned in the order of their hash values.  Items with identical hash
+// values are sorted based on the `Ord` trait.
+
+pub(crate) struct OrderedIter<'a, A> {
+    count: usize,
+    stack: Vec<ChunkIter<'a, Entry<A>, HashWidth>>,
+    current: ChunkIter<'a, Entry<A>, HashWidth>,
+    collision: Option<(HashBits, std::vec::IntoIter<&'a A>)>,
+}
+
+impl<'a, A> OrderedIter<'a, A>
+where
+    A: 'a,
+{
+    pub(crate) fn new(root: &'a Node<A>, size: usize) -> Self {
+        OrderedIter {
+            count: size,
+            stack: Vec::with_capacity((HASH_WIDTH / HASH_SHIFT) + 1),
+            current: root.data.iter(),
+            collision: None,
+        }
+    }
+}
+
+impl<'a, A> Iterator for OrderedIter<'a, A>
+where
+    A: 'a + Ord,
+{
+    type Item = (&'a A, HashBits);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.count == 0 {
+            return None;
+        }
+        if self.collision.is_some() {
+            if let Some((hash, ref mut coll)) = self.collision {
+                match coll.next() {
+                    None => {}
+                    Some(value) => {
+                        self.count -= 1;
+                        return Some((value, hash));
+                    }
+                }
+            }
+            self.collision = None;
+            return self.next();
+        }
+        match self.current.next() {
+            Some(Entry::Value(value, hash)) => {
+                self.count -= 1;
+                Some((value, *hash))
+            }
+            Some(Entry::Node(child)) => {
+                let current = mem::replace(&mut self.current, child.data.iter());
+                self.stack.push(current);
+                self.next()
+            }
+            Some(Entry::Collision(coll)) => {
+                let mut refs: Vec<&'a A> = coll.data.iter().collect();
+                refs.sort();
+                self.collision = Some((coll.hash, refs.into_iter()));
+                self.next()
+            }
+            None => match self.stack.pop() {
+                None => None,
+                Some(iter) => {
+                    self.current = iter;
+                    self.next()
+                }
+            },
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.count, Some(self.count))
+    }
+}
+
+impl<'a, A> ExactSizeIterator for OrderedIter<'a, A> where A: 'a + Ord {}
+
+impl<'a, A> FusedIterator for OrderedIter<'a, A> where A: 'a + Ord {}
+
 // Mut ref iterator
 
 pub(crate) struct IterMut<'a, A> {
@@ -709,6 +795,91 @@ where
 impl<A: HashValue> ExactSizeIterator for Drain<A> where A: Clone {}
 
 impl<A: HashValue> FusedIterator for Drain<A> where A: Clone {}
+
+// Ordered consuming iterator
+
+pub(crate) struct OrderedDrain<A>
+where
+    A: HashValue,
+{
+    count: usize,
+    pool: Pool<Node<A>>,
+    stack: Vec<PoolRef<Node<A>>>,
+    current: PoolRef<Node<A>>,
+    collision: Option<CollisionNode<A>>,
+}
+
+impl<A> OrderedDrain<A>
+where
+    A: HashValue,
+{
+    pub(crate) fn new(pool: &Pool<Node<A>>, root: PoolRef<Node<A>>, size: usize) -> Self {
+        OrderedDrain {
+            count: size,
+            pool: pool.clone(),
+            stack: vec![],
+            current: root,
+            collision: None,
+        }
+    }
+}
+
+impl<A> Iterator for OrderedDrain<A>
+where
+    A: HashValue + Clone + Ord,
+{
+    type Item = (A, HashBits);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.count == 0 {
+            return None;
+        }
+        if self.collision.is_some() {
+            if let Some(ref mut coll) = self.collision {
+                if let Some(value) = coll.data.pop() {
+                    self.count -= 1;
+                    return Some((value, coll.hash));
+                }
+            }
+            self.collision = None;
+            return self.next();
+        }
+        match PoolRef::make_mut(&self.pool, &mut self.current).data.pop() {
+            Some(Entry::Value(value, hash)) => {
+                self.count -= 1;
+                Some((value, hash))
+            }
+            Some(Entry::Collision(coll_ref)) => {
+                let mut coll = clone_ref(coll_ref);
+                // Sort the vector to ensure that elements with the same hash value
+                // come out in the same order regardless of the insertion order.
+                coll.data.sort();
+                self.collision = Some(coll);
+                self.next()
+            }
+            Some(Entry::Node(child)) => {
+                let parent = mem::replace(&mut self.current, child);
+                self.stack.push(parent);
+                self.next()
+            }
+            None => match self.stack.pop() {
+                None => None,
+                Some(parent) => {
+                    self.current = parent;
+                    self.next()
+                }
+            },
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.count, Some(self.count))
+    }
+}
+
+impl<A: HashValue> ExactSizeIterator for OrderedDrain<A> where A: Clone + Ord {}
+
+impl<A: HashValue> FusedIterator for OrderedDrain<A> where A: Clone + Ord {}
 
 impl<A: HashValue + fmt::Debug> fmt::Debug for Node<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {

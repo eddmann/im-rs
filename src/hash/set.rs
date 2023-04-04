@@ -31,7 +31,10 @@ use std::iter::FusedIterator;
 use std::iter::{FromIterator, IntoIterator, Sum};
 use std::ops::{Add, Deref, Mul};
 
-use crate::nodes::hamt::{hash_key, Drain as NodeDrain, HashValue, Iter as NodeIter, Node};
+use crate::nodes::hamt::{
+    hash_key, Drain as NodeDrain, HashValue, Iter as NodeIter, Node,
+    OrderedDrain as NodeOrderedDrain, OrderedIter as NodeOrderedIter,
+};
 use crate::ordset::OrdSet;
 use crate::util::{Pool, PoolRef, Ref};
 use crate::Vector;
@@ -313,15 +316,44 @@ impl<A, S> HashSet<A, S> {
 
     /// Get an iterator over the values in a hash set.
     ///
+    /// No ordering guarantees are provided.
+    #[must_use]
+    pub fn iter(&self) -> Iter<'_, A> {
+        Iter {
+            it: NodeIter::new(&self.root, self.size),
+        }
+    }
+    
+    /// Get an ordered iterator over the values in a hash set.
+    ///
     /// Please note that the order is consistent between sets using
     /// the same hasher, but no other ordering guarantee is offered.
     /// Items will not come out in insertion order or sort order.
     /// They will, however, come out in the same order every time for
     /// the same set.
     #[must_use]
-    pub fn iter(&self) -> Iter<'_, A> {
-        Iter {
-            it: NodeIter::new(&self.root, self.size),
+    pub fn ordered_iter(&self) -> OrderedIter<'_, A> {
+        OrderedIter {
+            it: NodeOrderedIter::new(&self.root, self.size),
+        }
+    }
+}
+
+impl<A, S> HashSet<A, S>
+where
+A: Hash + Clone + Ord
+{
+    /// Get an ordered iterator over the values in a hash set.
+    ///
+    /// Please note that the order is consistent between sets using
+    /// the same hasher, but no other ordering guarantee is offered.
+    /// Items will not come out in insertion order or sort order.
+    /// They will, however, come out in the same order every time for
+    /// the same set.
+    #[must_use]
+    pub fn into_ordered_iter(self) -> OrderedConsumingIter<A> {
+        OrderedConsumingIter {
+            it: NodeOrderedDrain::new(&self.pool.0, self.root, self.size),
         }
     }
 }
@@ -672,14 +704,14 @@ where
 
 impl<A, S> PartialOrd for HashSet<A, S>
 where
-    A: Hash + Eq + Clone + PartialOrd,
+    A: Hash + Eq + Clone + PartialOrd + Ord,
     S: BuildHasher + Default,
 {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         if Ref::ptr_eq(&self.hasher, &other.hasher) {
-            return self.iter().partial_cmp(other.iter());
+            return self.ordered_iter().partial_cmp(other.ordered_iter());
         }
-        self.iter().partial_cmp(other.iter())
+        self.ordered_iter().partial_cmp(other.ordered_iter())
     }
 }
 
@@ -690,22 +722,22 @@ where
 {
     fn cmp(&self, other: &Self) -> Ordering {
         if Ref::ptr_eq(&self.hasher, &other.hasher) {
-            return self.iter().cmp(other.iter());
+            return self.ordered_iter().cmp(other.ordered_iter());
         }
-        self.iter().cmp(other.iter())
+        self.ordered_iter().cmp(other.ordered_iter())
     }
 }
 
 impl<A, S> Hash for HashSet<A, S>
 where
-    A: Hash + Eq,
+    A: Hash + Eq + Ord,
     S: BuildHasher + Default,
 {
     fn hash<H>(&self, state: &mut H)
     where
         H: Hasher,
     {
-        for i in self.iter() {
+        for i in self.ordered_iter() {
             i.hash(state);
         }
     }
@@ -862,6 +894,35 @@ impl<'a, A> ExactSizeIterator for Iter<'a, A> {}
 
 impl<'a, A> FusedIterator for Iter<'a, A> {}
 
+/// An ordered iterator over the elements of a set.
+/// Given a deterministic hasher, this iterator yields values in a deterministic
+/// order: two sets with the same elements are enumerated in the same order
+/// regardless of the order in which elements were inserted in the sets.  Items
+/// are returned in the order of their hash values.  Items with identical hash
+/// values are sorted based on the `Ord` trait.
+pub struct OrderedIter<'a, A> {
+    it: NodeOrderedIter<'a, Value<A>>,
+}
+
+impl<'a, A> Iterator for OrderedIter<'a, A>
+where
+    A: 'a + Ord,
+{
+    type Item = &'a A;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.it.next().map(|(v, _)| &v.0)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.it.size_hint()
+    }
+}
+
+impl<'a, A: Ord> ExactSizeIterator for OrderedIter<'a, A> {}
+
+impl<'a, A: Ord> FusedIterator for OrderedIter<'a, A> {}
+
 /// A consuming iterator over the elements of a set.
 pub struct ConsumingIter<A>
 where
@@ -888,6 +949,32 @@ where
 impl<A> ExactSizeIterator for ConsumingIter<A> where A: Hash + Eq + Clone {}
 
 impl<A> FusedIterator for ConsumingIter<A> where A: Hash + Eq + Clone {}
+
+/// An ordered consuming iterator over the elements of a set.
+pub struct OrderedConsumingIter<A>
+    where A: Hash + Eq + Clone + Ord,
+{
+    it: NodeOrderedDrain<Value<A>>,
+}
+
+impl<A> Iterator for OrderedConsumingIter<A>
+where
+    A: Hash + Eq + Clone + Ord,
+{
+    type Item = A;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.it.next().map(|(v, _)| v.0)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.it.size_hint()
+    }
+}
+
+impl<A> ExactSizeIterator for OrderedConsumingIter<A> where A: Hash + Eq + Clone + Ord {}
+
+impl<A> FusedIterator for OrderedConsumingIter<A> where A: Hash + Eq + Clone + Ord {}
 
 // Iterator conversions
 
@@ -1068,6 +1155,7 @@ mod test {
     use crate::test::LolHasher;
     use ::proptest::num::i16;
     use ::proptest::proptest;
+    use std::collections::hash_map::DefaultHasher;
     use std::hash::BuildHasherDefault;
 
     #[test]
@@ -1122,6 +1210,39 @@ mod test {
                 panic!();
             }
         }
+    }
+
+    #[test]
+    fn consistent_ord() {
+        let mut set1 = HashSet::with_hasher(<BuildHasherDefault<DefaultHasher>>::default());
+        let mut set2 = HashSet::with_hasher(<BuildHasherDefault<DefaultHasher>>::default());
+
+        // Create two sets with identical elements but different insertion order.
+        // The sets are big enough to trigger hash collisions.
+        for i in 0..50_001 {
+            set1.insert(i);
+            set2.insert(50_000 - i);
+        }
+
+        // The sets are the same according to Eq, Ord, and Hash.
+        assert_eq!(set1, set2);
+        assert_eq!(set1.cmp(&set2), Ordering::Equal);
+
+        let mut s = DefaultHasher::new();
+        set1.hash(&mut s);
+        let hash1 = s.finish();
+
+        let mut s = DefaultHasher::new();
+        set2.hash(&mut s);
+        let hash2 = s.finish();
+        assert_eq!(hash1, hash2);
+
+        // Ordered iterators must yield elements in the same order.
+        let v1: Vec<_> = set1.into_ordered_iter().collect();
+        let v2: Vec<_> = set2.into_ordered_iter().collect();
+        // Don't use `assert_eq!`, as on error it allocates a vector
+        // of size `v1.len() * v2.len()` and runs out of memory.
+        assert!(v1 == v2);
     }
 
     proptest! {
